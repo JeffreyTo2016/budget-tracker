@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<meta name="theme-color" content="#1E1E1E" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Budget" />
+<title>Family Budget</title>
+
+<!-- PWA manifest (inlined as a blob so the whole app is one file) -->
+<link rel="manifest" id="manifest-placeholder" />
+<link rel="apple-touch-icon" id="apple-icon" />
+
+<style>
+  * { -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #1E1E1E; overscroll-behavior: none; }
+  #root { background: #F8F8F6; }
+  input, select, button { font-family: 'Georgia', serif; }
+  @keyframes pulse { 0%,100%{opacity:0.3} 50%{opacity:1} }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+/* ---------- Generate app icon as a data URL (canvas) ---------- */
+function makeIcon(size) {
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  const x = c.getContext('2d');
+  x.fillStyle = '#1E1E1E';
+  x.fillRect(0, 0, size, size);
+  x.fillStyle = '#F2CC8F';
+  x.font = `bold ${size * 0.55}px Georgia, serif`;
+  x.textAlign = 'center';
+  x.textBaseline = 'middle';
+  x.fillText('$', size / 2, size * 0.54);
+  // little green accent bar
+  x.fillStyle = '#81B29A';
+  x.fillRect(size * 0.25, size * 0.8, size * 0.5, size * 0.06);
+  return c.toDataURL('image/png');
+}
+const icon192 = makeIcon(192);
+const icon512 = makeIcon(512);
+document.getElementById('apple-icon').href = icon192;
+
+/* ---------- Inline the manifest as a blob URL ---------- */
+const manifest = {
+  name: "Family Budget Tracker",
+  short_name: "Budget",
+  start_url: ".",
+  display: "standalone",
+  background_color: "#1E1E1E",
+  theme_color: "#1E1E1E",
+  icons: [
+    { src: icon192, sizes: "192x192", type: "image/png", purpose: "any maskable" },
+    { src: icon512, sizes: "512x512", type: "image/png", purpose: "any maskable" }
+  ]
+};
+const manifestBlob = new Blob([JSON.stringify(manifest)], { type: 'application/json' });
+document.getElementById('manifest-placeholder').href = URL.createObjectURL(manifestBlob);
+
+/* ---------- Register a minimal service worker for offline use ---------- */
+if ('serviceWorker' in navigator) {
+  const swCode = `
+    const CACHE = 'budget-v1';
+    self.addEventListener('install', e => self.skipWaiting());
+    self.addEventListener('activate', e => self.clients.claim());
+    self.addEventListener('fetch', e => {
+      e.respondWith(
+        caches.open(CACHE).then(cache =>
+          cache.match(e.request).then(hit =>
+            hit || fetch(e.request).then(resp => {
+              if (e.request.method === 'GET' && resp.status === 200) cache.put(e.request, resp.clone());
+              return resp;
+            }).catch(() => caches.match('./'))
+          )
+        )
+      );
+    });
+  `;
+  const swBlob = new Blob([swCode], { type: 'application/javascript' });
+  const swUrl = URL.createObjectURL(swBlob);
+  navigator.serviceWorker.register(swUrl).catch(() => {});
+}
+</script>
+
+<!-- React via CDN -->
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useEffect } = React;
+
+const INCOME = 9000;
+const SAVINGS_GOAL = 300;
+const SPENDABLE = INCOME - SAVINGS_GOAL;
+
+const CATEGORIES = [
+  { id: "housing",       label: "Housing & Utilities",   icon: "🏠", budget: 2520, color: "#E07A5F" },
+  { id: "food",          label: "Food & Groceries",       icon: "🛒", budget: 1080, color: "#F2CC8F" },
+  { id: "transport",     label: "Transport",              icon: "🚗", budget: 720,  color: "#81B29A" },
+  { id: "kids",          label: "Kids & Education",       icon: "📚", budget: 900,  color: "#6B9AC4" },
+  { id: "entertainment", label: "Entertainment & Dining", icon: "🍽️", budget: 540,  color: "#B5838D" },
+  { id: "healthcare",    label: "Healthcare",             icon: "💊", budget: 450,  color: "#A8DADC" },
+  { id: "clothing",      label: "Clothing",               icon: "👗", budget: 270,  color: "#C9ADA7" },
+  { id: "subscriptions", label: "Subscriptions",          icon: "📱", budget: 120,  color: "#9B8EC4" },
+];
+
+const FREQ_LABELS = { monthly: "Monthly", weekly: "Weekly", yearly: "Yearly" };
+const FREQ_MONTHLY = { monthly: 1, weekly: 4.33, yearly: 1 / 12 };
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+const today = () => new Date().toISOString().slice(0, 10);
+const fmt = (n) => `$${Math.abs(Number(n)).toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`;
+const getCat = (id) => CATEGORIES.find((c) => c.id === id);
+
+const SAMPLE_TXN = [
+  { id: 1,  date: "2026-05-02", categoryId: "food",          note: "Whole Foods",         amount: 210 },
+  { id: 2,  date: "2026-05-07", categoryId: "transport",     note: "Gas",                 amount: 80  },
+  { id: 3,  date: "2026-05-10", categoryId: "kids",          note: "Soccer registration", amount: 120 },
+  { id: 4,  date: "2026-05-12", categoryId: "food",          note: "Trader Joe's",        amount: 145 },
+  { id: 5,  date: "2026-05-14", categoryId: "entertainment", note: "Family dinner out",   amount: 95  },
+  { id: 6,  date: "2026-05-18", categoryId: "healthcare",    note: "Pharmacy",            amount: 45  },
+  { id: 7,  date: "2026-05-20", categoryId: "clothing",      note: "Kids school shoes",   amount: 70  },
+  { id: 8,  date: "2026-04-03", categoryId: "food",          note: "Whole Foods",         amount: 195 },
+  { id: 9,  date: "2026-04-08", categoryId: "transport",     note: "Gas",                 amount: 75  },
+  { id: 10, date: "2026-04-11", categoryId: "entertainment", note: "Movie night",         amount: 60  },
+  { id: 11, date: "2026-04-15", categoryId: "food",          note: "Costco run",          amount: 310 },
+  { id: 12, date: "2026-04-20", categoryId: "clothing",      note: "Spring clothes",      amount: 140 },
+  { id: 13, date: "2026-04-25", categoryId: "entertainment", note: "Restaurant",          amount: 110 },
+  { id: 14, date: "2026-03-05", categoryId: "food",          note: "Whole Foods",         amount: 220 },
+  { id: 15, date: "2026-03-10", categoryId: "transport",     note: "Gas + Car wash",      amount: 95  },
+  { id: 16, date: "2026-03-14", categoryId: "entertainment", note: "Family outing",       amount: 145 },
+  { id: 17, date: "2026-03-18", categoryId: "food",          note: "Trader Joe's",        amount: 160 },
+  { id: 18, date: "2026-03-22", categoryId: "healthcare",    note: "Dentist co-pay",      amount: 80  },
+  { id: 19, date: "2026-03-28", categoryId: "kids",          note: "School supplies",     amount: 55  },
+];
+
+const SAMPLE_RECURRING = [
+  { id: 1, categoryId: "housing",       name: "Mortgage",         amount: 1800, frequency: "monthly", dayOfMonth: 1,  active: true },
+  { id: 2, categoryId: "housing",       name: "Electricity",      amount: 130,  frequency: "monthly", dayOfMonth: 15, active: true },
+  { id: 3, categoryId: "transport",     name: "Car Loan",         amount: 420,  frequency: "monthly", dayOfMonth: 5,  active: true },
+  { id: 4, categoryId: "subscriptions", name: "Netflix",          amount: 18,   frequency: "monthly", dayOfMonth: 8,  active: true },
+  { id: 5, categoryId: "subscriptions", name: "Spotify Family",   amount: 17,   frequency: "monthly", dayOfMonth: 8,  active: true },
+  { id: 6, categoryId: "healthcare",    name: "Health Insurance", amount: 280,  frequency: "monthly", dayOfMonth: 1,  active: true },
+  { id: 7, categoryId: "kids",          name: "School Fees",      amount: 200,  frequency: "monthly", dayOfMonth: 3,  active: true },
+];
+
+/* ---------- localStorage persistence helpers ---------- */
+const load = (key, fallback) => {
+  try {
+    const v = localStorage.getItem(key);
+    return v ? JSON.parse(v) : fallback;
+  } catch { return fallback; }
+};
+const save = (key, val) => {
+  try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
+};
+
+function App() {
+  const [tab, setTab] = useState("dashboard");
+  const [transactions, setTransactions] = useState(() => load("bt_txn", SAMPLE_TXN));
+  const [recurring, setRecurring] = useState(() => load("bt_rec", SAMPLE_RECURRING));
+  const [nextTxnId, setNextTxnId] = useState(() => load("bt_ntid", SAMPLE_TXN.length + 1));
+  const [nextRecId, setNextRecId] = useState(() => load("bt_nrid", SAMPLE_RECURRING.length + 1));
+  const [form, setForm] = useState({ date: today(), categoryId: "food", note: "", amount: "" });
+  const [formError, setFormError] = useState("");
+  const [addedFlash, setAddedFlash] = useState(false);
+  const [recForm, setRecForm] = useState({ categoryId: "housing", name: "", amount: "", frequency: "monthly", dayOfMonth: 1 });
+  const [recError, setRecError] = useState("");
+  const [recFlash, setRecFlash] = useState(false);
+  const [addMode, setAddMode] = useState("onetime");
+  const [filterCat, setFilterCat] = useState("all");
+  const [sortOrder, setSortOrder] = useState("newest");
+  const [aiInsight, setAiInsight] = useState("");
+  const [aiLoading, setAiLoading] = useState(false);
+  const [showInstall, setShowInstall] = useState(false);
+
+  // persist on change
+  useEffect(() => save("bt_txn", transactions), [transactions]);
+  useEffect(() => save("bt_rec", recurring), [recurring]);
+  useEffect(() => save("bt_ntid", nextTxnId), [nextTxnId]);
+  useEffect(() => save("bt_nrid", nextRecId), [nextRecId]);
+
+  // show install hint on iOS Safari (not already installed)
+  useEffect(() => {
+    const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+    const standalone = window.navigator.standalone || window.matchMedia('(display-mode: standalone)').matches;
+    if (isIOS && !standalone && !load("bt_dismissed_install", false)) {
+      setShowInstall(true);
+    }
+  }, []);
+
+  const recurringMonthly = useMemo(() => {
+    const m = {}; CATEGORIES.forEach((c) => { m[c.id] = 0; });
+    recurring.filter((r) => r.active).forEach((r) => { m[r.categoryId] = (m[r.categoryId] || 0) + r.amount * FREQ_MONTHLY[r.frequency]; });
+    return m;
+  }, [recurring]);
+  const totalRecurring = Object.values(recurringMonthly).reduce((a, b) => a + b, 0);
+
+  const byMonth = useMemo(() => {
+    const m = {};
+    transactions.forEach((t) => { const k = t.date.slice(0, 7); if (!m[k]) m[k] = {}; m[k][t.categoryId] = (m[k][t.categoryId] || 0) + t.amount; });
+    return m;
+  }, [transactions]);
+  const monthKeys = useMemo(() => Object.keys(byMonth).sort().reverse(), [byMonth]);
+  const currentMonthKey = "2026-05";
+
+  const oneTimeSpent = useMemo(() => {
+    const o = {}; CATEGORIES.forEach((c) => { o[c.id] = 0; });
+    transactions.filter(t => t.date.startsWith(currentMonthKey)).forEach((t) => { o[t.categoryId] = (o[t.categoryId] || 0) + t.amount; });
+    return o;
+  }, [transactions]);
+  const totalOneTime = Object.values(oneTimeSpent).reduce((a, b) => a + b, 0);
+  const totalSpent = totalRecurring + totalOneTime;
+  const remaining = SPENDABLE - totalSpent;
+
+  const addTransaction = () => {
+    if (!form.amount || isNaN(Number(form.amount)) || Number(form.amount) <= 0) { setFormError("Please enter a valid amount."); return; }
+    if (!form.note.trim()) { setFormError("Please add a note."); return; }
+    setFormError("");
+    setTransactions((p) => [{ id: nextTxnId, date: form.date, categoryId: form.categoryId, note: form.note.trim(), amount: Number(form.amount) }, ...p]);
+    setNextTxnId((n) => n + 1);
+    setForm((f) => ({ ...f, note: "", amount: "" }));
+    setAddedFlash(true); setTimeout(() => setAddedFlash(false), 1500);
+    setTab("history");
+  };
+  const addRecurring = () => {
+    if (!recForm.amount || isNaN(Number(recForm.amount)) || Number(recForm.amount) <= 0) { setRecError("Please enter a valid amount."); return; }
+    if (!recForm.name.trim()) { setRecError("Please enter a name."); return; }
+    setRecError("");
+    setRecurring((p) => [...p, { id: nextRecId, categoryId: recForm.categoryId, name: recForm.name.trim(), amount: Number(recForm.amount), frequency: recForm.frequency, dayOfMonth: Number(recForm.dayOfMonth), active: true }]);
+    setNextRecId((n) => n + 1);
+    setRecForm({ categoryId: "housing", name: "", amount: "", frequency: "monthly", dayOfMonth: 1 });
+    setRecFlash(true); setTimeout(() => setRecFlash(false), 1500);
+    setTab("recurring");
+  };
+  const toggleRecurring = (id) => setRecurring((p) => p.map((r) => r.id === id ? { ...r, active: !r.active } : r));
+  const deleteRecurring = (id) => setRecurring((p) => p.filter((r) => r.id !== id));
+  const deleteTransaction = (id) => setTransactions((p) => p.filter((t) => t.id !== id));
+
+  const filtered = useMemo(() => {
+    let list = filterCat === "all" ? [...transactions] : transactions.filter((t) => t.categoryId === filterCat);
+    list.sort((a, b) => sortOrder === "newest" ? new Date(b.date) - new Date(a.date) : new Date(a.date) - new Date(b.date));
+    return list;
+  }, [transactions, filterCat, sortOrder]);
+
+  const fetchAiInsight = async () => {
+    setAiLoading(true); setAiInsight("");
+    const catSummary = CATEGORIES.map((c) => {
+      const rec = recurringMonthly[c.id] || 0, one = oneTimeSpent[c.id] || 0, prev = byMonth["2026-04"]?.[c.id] || 0;
+      return `${c.label}: budget $${c.budget}, spent $${Math.round(rec + one)} (recurring $${Math.round(rec)}, one-time $${Math.round(one)}), prev month one-time $${prev}`;
+    }).join("\n");
+    const recList = recurring.filter(r => r.active).map(r => `${r.name} ($${r.amount}/${r.frequency})`).join(", ");
+    const prompt = `You are a friendly family budget advisor. Here is this family's May 2026 budget data:
+
+Income: $${INCOME}/mo, Savings goal: $${SAVINGS_GOAL}/mo, Spendable: $${SPENDABLE}/mo
+Total spent this month: $${Math.round(totalSpent)} (${remaining >= 0 ? `$${Math.round(remaining)} under budget` : `$${Math.round(Math.abs(remaining))} OVER budget`})
+
+Category breakdown:
+${catSummary}
+
+Active recurring expenses: ${recList}
+
+Give a warm, practical monthly summary with: 1) a 2-sentence overall assessment, 2) top 3 specific areas to save money with a dollar amount and concrete tip for each (use bullets), 3) one positive thing they do well, 4) a motivational closing line. Keep it concise and specific. No headers.`;
+    try {
+      const r = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, messages: [{ role: "user", content: prompt }] }),
+      });
+      const d = await r.json();
+      setAiInsight(d.content?.map(b => b.text || "").join("") || "Unable to generate insights right now.");
+    } catch { setAiInsight("Could not connect to AI. (The analysis feature needs an internet connection.)"); }
+    setAiLoading(false);
+  };
+
+  const fmtMonthKey = (k) => { const [y, m] = k.split("-"); return `${MONTHS[parseInt(m) - 1]} ${y}`; };
+  const dismissInstall = () => { setShowInstall(false); save("bt_dismissed_install", true); };
+
+  return (
+    <div style={s.root}>
+      {showInstall && (
+        <div style={s.installBanner}>
+          <div style={{ flex: 1, fontSize: 12, lineHeight: 1.4 }}>
+            <strong>Install this app:</strong> tap <span style={{ fontSize: 15 }}>⎙</span> Share, then <strong>"Add to Home Screen"</strong>
+          </div>
+          <button onClick={dismissInstall} style={s.installClose}>✕</button>
+        </div>
+      )}
+
+      <div style={s.header}>
+        <div style={s.headerInner}>
+          <div><div style={s.eyebrow}>MAY 2026</div><div style={s.title}>Family Spending</div></div>
+          <div style={s.chips}>
+            <div style={s.chip}><div style={s.chipLabel}>Budget</div><div style={s.chipVal}>{fmt(SPENDABLE)}</div></div>
+            <div style={{ ...s.chip, borderColor: remaining < 0 ? "#E07A5F" : "#81B29A" }}>
+              <div style={s.chipLabel}>{remaining < 0 ? "Over" : "Left"}</div>
+              <div style={{ ...s.chipVal, color: remaining < 0 ? "#E07A5F" : "#81B29A" }}>{fmt(remaining)}</div>
+            </div>
+          </div>
+        </div>
+        <div style={s.masterBarBg}>
+          <div style={{ position: "absolute", left: 0, top: 0, height: "100%", width: `${Math.min(100, (totalRecurring / SPENDABLE) * 100)}%`, background: "#E07A5F", borderRadius: 4 }} />
+          <div style={{ position: "absolute", left: `${Math.min(100, (totalRecurring / SPENDABLE) * 100)}%`, top: 0, height: "100%", width: `${Math.min(100 - (totalRecurring / SPENDABLE) * 100, (totalOneTime / SPENDABLE) * 100)}%`, background: "#F2CC8F", borderRadius: 4 }} />
+        </div>
+        <div style={s.masterBarLabels}>
+          <span style={{ color: "#E07A5F", fontSize: 10 }}>🔁 {fmt(totalRecurring)}</span>
+          <span style={{ color: "#F2CC8F", fontSize: 10 }}>{fmt(totalOneTime)} one-time</span>
+          <span style={{ color: remaining < 0 ? "#E07A5F" : "#81B29A", fontSize: 10 }}>{remaining < 0 ? "⚠ over" : fmt(remaining) + " left"}</span>
+        </div>
+      </div>
+
+      <div style={s.tabBar}>
+        {[["dashboard","📊","Today"],["monthly","📅","Monthly"],["add","➕","Add"],["recurring","🔁","Bills"],["history","🗂","History"]].map(([id, icon, label]) => (
+          <button key={id} onClick={() => setTab(id)} style={{ ...s.tabBtn, ...(tab === id ? s.tabBtnActive : {}) }}>
+            <span style={{ fontSize: 15 }}>{icon}</span><span style={{ fontSize: 9, display: "block", marginTop: 2 }}>{label}</span>
+          </button>
+        ))}
+      </div>
+
+      {tab === "dashboard" && (
+        <div style={s.body}>
+          <div style={s.sectionTitle}>THIS MONTH — CATEGORY STATUS</div>
+          {CATEGORIES.map((cat) => {
+            const recAmt = recurringMonthly[cat.id] || 0, oneAmt = oneTimeSpent[cat.id] || 0, total2 = recAmt + oneAmt;
+            const pct = Math.min(100, (total2 / cat.budget) * 100), recPct = Math.min(100, (recAmt / cat.budget) * 100), over = total2 > cat.budget;
+            return (
+              <div key={cat.id} style={s.catCard}>
+                <div style={s.catCardTop}><span style={s.catIcon}>{cat.icon}</span><span style={s.catName}>{cat.label}</span>
+                  <span style={{ ...s.catBadge, background: over ? "#FDECEA" : "#F0FAF5", color: over ? "#E07A5F" : "#81B29A" }}>{over ? `⚠ ${fmt(total2 - cat.budget)} over` : `${fmt(cat.budget - total2)} left`}</span>
+                </div>
+                <div style={s.catBarBg}>
+                  <div style={{ position: "absolute", left: 0, top: 0, height: "100%", width: `${recPct}%`, background: cat.color, opacity: 0.4, borderRadius: 4 }} />
+                  <div style={{ position: "absolute", left: `${recPct}%`, top: 0, height: "100%", width: `${Math.max(0, pct - recPct)}%`, background: over ? "#E07A5F" : cat.color, borderRadius: 4 }} />
+                </div>
+                <div style={s.catBarLabels}><span>{fmt(total2)} spent</span>{recAmt > 0 && <span style={{ color: "#ddd" }}>🔁 {fmt(recAmt)}</span>}<span style={{ color: "#bbb" }}>of {fmt(cat.budget)}</span></div>
+              </div>
+            );
+          })}
+          <div style={{ ...s.catCard, border: "1.5px solid #81B29A" }}>
+            <div style={s.catCardTop}><span style={s.catIcon}>💰</span><span style={s.catName}>Savings</span><span style={{ ...s.catBadge, background: "#F0FAF5", color: "#81B29A" }}>locked</span></div>
+            <div style={s.catBarBg}><div style={{ position: "absolute", left: 0, top: 0, height: "100%", width: "100%", background: "#81B29A", borderRadius: 4 }} /></div>
+            <div style={s.catBarLabels}><span>{fmt(SAVINGS_GOAL)} reserved</span><span style={{ color: "#bbb" }}>goal {fmt(SAVINGS_GOAL)}</span></div>
+          </div>
+        </div>
+      )}
+
+      {tab === "monthly" && (
+        <div style={s.body}>
+          <div style={s.aiCard}>
+            <div style={s.aiCardTop}>
+              <div><div style={s.aiTitle}>✨ AI Savings Analysis</div><div style={s.aiSubtitle}>Personalized tips based on your spending</div></div>
+              <button onClick={fetchAiInsight} disabled={aiLoading} style={{ ...s.aiBtn, opacity: aiLoading ? 0.6 : 1 }}>{aiLoading ? "Analyzing…" : aiInsight ? "Refresh" : "Analyze"}</button>
+            </div>
+            {aiLoading && <div style={s.aiLoading}><div style={s.aiDot} /><div style={{ ...s.aiDot, animationDelay: "0.2s" }} /><div style={{ ...s.aiDot, animationDelay: "0.4s" }} /><span style={{ marginLeft: 8, color: "#999", fontSize: 12 }}>Reading your spending…</span></div>}
+            {aiInsight && !aiLoading && <div style={s.aiText}>{aiInsight.split("\n").map((line, i) => <p key={i} style={{ margin: "4px 0", lineHeight: 1.6 }}>{line}</p>)}</div>}
+            {!aiInsight && !aiLoading && <div style={s.aiPlaceholder}>Tap "Analyze" for personalized savings tips based on your actual spending.</div>}
+          </div>
+          <div style={s.sectionTitle}>MONTH BY MONTH</div>
+          {monthKeys.map((key) => {
+            const monthData = byMonth[key] || {}, monthOneTime = Object.values(monthData).reduce((a, b) => a + b, 0);
+            const monthTotal = monthOneTime + totalRecurring, barW = Math.min(100, (monthTotal / SPENDABLE) * 100), over = monthTotal > SPENDABLE;
+            return (
+              <div key={key} style={s.monthCard}>
+                <div style={s.monthCardTop}><span style={s.monthLabel}>{fmtMonthKey(key)}</span>{key === currentMonthKey && <span style={s.currentBadge}>Current</span>}<span style={{ ...s.monthTotal, color: over ? "#E07A5F" : "#2D2D2D" }}>{fmt(monthTotal)}</span></div>
+                <div style={s.catBarBg}><div style={{ position: "absolute", left: 0, top: 0, height: "100%", width: `${barW}%`, background: over ? "#E07A5F" : "#81B29A", borderRadius: 4, opacity: 0.7 }} /></div>
+                <div style={s.catBarLabels}><span style={{ color: "#aaa" }}>🔁 {fmt(totalRecurring)} fixed</span><span style={{ color: "#aaa" }}>{fmt(monthOneTime)} variable</span><span style={{ color: over ? "#E07A5F" : "#81B29A" }}>{over ? `⚠ ${fmt(monthTotal - SPENDABLE)} over` : `${fmt(SPENDABLE - monthTotal)} saved`}</span></div>
+                <div style={s.miniCatGrid}>
+                  {CATEGORIES.map((cat) => {
+                    const tot = (recurringMonthly[cat.id] || 0) + (monthData[cat.id] || 0); if (tot === 0) return null;
+                    return (<div key={cat.id} style={s.miniCatRow}><span style={s.miniCatIcon}>{cat.icon}</span><div style={{ flex: 1 }}><div style={s.miniBarBg}><div style={{ ...s.miniBarFill, width: `${Math.min(100, (tot / cat.budget) * 100)}%`, background: tot > cat.budget ? "#E07A5F" : cat.color }} /></div></div><span style={s.miniCatAmt}>{fmt(tot)}</span></div>);
+                  })}
+                </div>
+              </div>
+            );
+          })}
+          <div style={s.sectionTitle}>SUBSCRIPTIONS AUDIT</div>
+          <div style={s.subAuditCard}>
+            {recurring.filter(r => r.categoryId === "subscriptions" && r.active).map(r => (
+              <div key={r.id} style={s.subRow}><span style={s.subIcon}>📱</span><span style={s.subName}>{r.name}</span><span style={s.subAmt}>{fmt(r.amount)}/mo</span><span style={s.subYear}>({fmt(r.amount * 12)}/yr)</span></div>
+            ))}
+            <div style={s.subTotal}>Total: {fmt(recurring.filter(r => r.categoryId === "subscriptions" && r.active).reduce((a, r) => a + r.amount, 0))}/mo · {fmt(recurring.filter(r => r.categoryId === "subscriptions" && r.active).reduce((a, r) => a + r.amount * 12, 0))}/yr</div>
+          </div>
+        </div>
+      )}
+
+      {tab === "add" && (
+        <div style={s.body}>
+          <div style={s.modeToggle}>
+            <button onClick={() => setAddMode("onetime")} style={{ ...s.modeBtn, ...(addMode === "onetime" ? s.modeBtnActive : {}) }}>One-time</button>
+            <button onClick={() => setAddMode("recurring")} style={{ ...s.modeBtn, ...(addMode === "recurring" ? s.modeBtnActive : {}) }}>🔁 Recurring</button>
+          </div>
+          {addMode === "onetime" ? (
+            <div style={s.formCard}>
+              <div style={s.sectionTitle}>ONE-TIME EXPENSE</div>
+              <div style={s.field}><label style={s.label}>Date</label><input type="date" value={form.date} onChange={(e) => setForm((f) => ({ ...f, date: e.target.value }))} style={s.input} /></div>
+              <div style={s.field}><label style={s.label}>Category</label><select value={form.categoryId} onChange={(e) => setForm((f) => ({ ...f, categoryId: e.target.value }))} style={s.input}>{CATEGORIES.map((c) => <option key={c.id} value={c.id}>{c.icon} {c.label}</option>)}</select></div>
+              <div style={s.field}><label style={s.label}>Note / Merchant</label><input type="text" placeholder="e.g. Whole Foods…" value={form.note} onChange={(e) => setForm((f) => ({ ...f, note: e.target.value }))} style={s.input} /></div>
+              <div style={s.field}><label style={s.label}>Amount ($)</label><input type="number" placeholder="0.00" min="0" step="0.01" value={form.amount} onChange={(e) => setForm((f) => ({ ...f, amount: e.target.value }))} style={{ ...s.input, fontSize: 20, fontWeight: 700 }} /></div>
+              {formError && <div style={s.error}>{formError}</div>}
+              <button onClick={addTransaction} style={{ ...s.btn, ...(addedFlash ? s.btnFlash : {}) }}>{addedFlash ? "✓ Added!" : "Add Expense"}</button>
+            </div>
+          ) : (
+            <div style={s.formCard}>
+              <div style={s.sectionTitle}>RECURRING EXPENSE</div>
+              <div style={s.field}><label style={s.label}>Name</label><input type="text" placeholder="e.g. Mortgage, Netflix…" value={recForm.name} onChange={(e) => setRecForm((f) => ({ ...f, name: e.target.value }))} style={s.input} /></div>
+              <div style={s.field}><label style={s.label}>Category</label><select value={recForm.categoryId} onChange={(e) => setRecForm((f) => ({ ...f, categoryId: e.target.value }))} style={s.input}>{CATEGORIES.map((c) => <option key={c.id} value={c.id}>{c.icon} {c.label}</option>)}</select></div>
+              <div style={s.field}><label style={s.label}>Amount ($)</label><input type="number" placeholder="0.00" min="0" step="0.01" value={recForm.amount} onChange={(e) => setRecForm((f) => ({ ...f, amount: e.target.value }))} style={{ ...s.input, fontSize: 20, fontWeight: 700 }} /></div>
+              <div style={{ display: "flex", gap: 10 }}>
+                <div style={{ ...s.field, flex: 1 }}><label style={s.label}>Frequency</label><select value={recForm.frequency} onChange={(e) => setRecForm((f) => ({ ...f, frequency: e.target.value }))} style={s.input}><option value="monthly">Monthly</option><option value="weekly">Weekly</option><option value="yearly">Yearly</option></select></div>
+                {recForm.frequency === "monthly" && <div style={{ ...s.field, flex: 1 }}><label style={s.label}>Day of Month</label><input type="number" min="1" max="31" value={recForm.dayOfMonth} onChange={(e) => setRecForm((f) => ({ ...f, dayOfMonth: e.target.value }))} style={s.input} /></div>}
+              </div>
+              <div style={s.recPreview}>Monthly cost: <strong>{fmt(Number(recForm.amount || 0) * FREQ_MONTHLY[recForm.frequency])}</strong></div>
+              {recError && <div style={s.error}>{recError}</div>}
+              <button onClick={addRecurring} style={{ ...s.btn, ...(recFlash ? s.btnFlash : {}) }}>{recFlash ? "✓ Added!" : "Add Recurring Expense"}</button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab === "recurring" && (
+        <div style={s.body}>
+          <div style={s.recurringHeader}><div><div style={s.sectionTitle}>RECURRING EXPENSES</div><div style={s.recTotal}>{fmt(totalRecurring)}<span style={{ fontSize: 11, color: "#aaa", fontWeight: 400 }}>/mo</span></div></div><button onClick={() => { setTab("add"); setAddMode("recurring"); }} style={s.addRecBtn}>+ Add</button></div>
+          {recurring.length === 0 && <div style={s.empty}>No recurring expenses yet.</div>}
+          {CATEGORIES.map((cat) => {
+            const catRec = recurring.filter((r) => r.categoryId === cat.id); if (catRec.length === 0) return null;
+            return (<div key={cat.id} style={{ marginBottom: 14 }}><div style={s.recGroupLabel}>{cat.icon} {cat.label}</div>
+              {catRec.map((r) => (<div key={r.id} style={{ ...s.recRow, opacity: r.active ? 1 : 0.45 }}>
+                <div style={s.recLeft}><div style={s.recName}>{r.name}</div><div style={s.recMeta}>{FREQ_LABELS[r.frequency]}{r.frequency === "monthly" && ` · due day ${r.dayOfMonth}`}</div></div>
+                <div style={s.recRight}><div style={s.recAmount}>{fmt(r.amount)}</div><button onClick={() => toggleRecurring(r.id)} style={{ ...s.iconBtn, color: r.active ? "#81B29A" : "#ccc" }}>{r.active ? "✓" : "○"}</button><button onClick={() => deleteRecurring(r.id)} style={{ ...s.iconBtn, color: "#eee" }}>✕</button></div>
+              </div>))}
+            </div>);
+          })}
+        </div>
+      )}
+
+      {tab === "history" && (
+        <div style={s.body}>
+          <div style={s.filterRow}>
+            <select value={filterCat} onChange={(e) => setFilterCat(e.target.value)} style={s.filterSelect}><option value="all">All categories</option>{CATEGORIES.map((c) => <option key={c.id} value={c.id}>{c.icon} {c.label}</option>)}</select>
+            <select value={sortOrder} onChange={(e) => setSortOrder(e.target.value)} style={s.filterSelect}><option value="newest">Newest first</option><option value="oldest">Oldest first</option></select>
+          </div>
+          <div style={s.txnCount}>{filtered.length} transaction{filtered.length !== 1 ? "s" : ""} · {fmt(filtered.reduce((a, t) => a + t.amount, 0))}</div>
+          {filtered.length === 0 && <div style={s.empty}>No expenses yet.</div>}
+          {filtered.map((txn) => { const cat = getCat(txn.categoryId);
+            return (<div key={txn.id} style={s.txnRow}><div style={{ ...s.txnDot, background: cat?.color }} /><div style={s.txnMid}><div style={s.txnNote}>{txn.note}</div><div style={s.txnMeta}>{cat?.icon} {cat?.label} · {txn.date}</div></div><div style={s.txnRight}><div style={s.txnAmount}>{fmt(txn.amount)}</div><button onClick={() => deleteTransaction(txn.id)} style={s.delBtn}>✕</button></div></div>);
+          })}
+        </div>
+      )}
+
+      <div style={s.footer}>💰 Savings goal: {fmt(SAVINGS_GOAL)}/mo · Income: {fmt(INCOME)}/mo · Data saved on this device</div>
+    </div>
+  );
+}
+
+const s = {
+  root: { fontFamily: "'Georgia', serif", maxWidth: 600, margin: "0 auto", background: "#F8F8F6", minHeight: "100vh", color: "#2D2D2D", paddingBottom: "env(safe-area-inset-bottom)" },
+  installBanner: { display: "flex", alignItems: "center", gap: 10, background: "#F2CC8F", color: "#1E1E1E", padding: "10px 14px" },
+  installClose: { background: "rgba(0,0,0,0.1)", border: "none", borderRadius: 6, padding: "4px 8px", cursor: "pointer", fontSize: 12 },
+  header: { background: "#1E1E1E", padding: "calc(20px + env(safe-area-inset-top)) 18px 12px", color: "#fff" },
+  headerInner: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 },
+  eyebrow: { fontSize: 9, letterSpacing: 3, color: "#777", marginBottom: 2 },
+  title: { fontSize: 24, fontWeight: 700 },
+  chips: { display: "flex", gap: 8 },
+  chip: { background: "#2A2A2A", border: "1px solid #444", borderRadius: 10, padding: "6px 12px", textAlign: "center" },
+  chipLabel: { fontSize: 9, color: "#777", letterSpacing: 1 },
+  chipVal: { fontSize: 16, fontWeight: 700, color: "#F2CC8F" },
+  masterBarBg: { position: "relative", background: "#333", borderRadius: 4, height: 6, overflow: "hidden", marginBottom: 6 },
+  masterBarLabels: { display: "flex", justifyContent: "space-between" },
+  tabBar: { display: "flex", background: "#fff", borderBottom: "2px solid #EBEBEB", position: "sticky", top: 0, zIndex: 10 },
+  tabBtn: { flex: 1, padding: "9px 2px", border: "none", background: "transparent", cursor: "pointer", color: "#bbb", fontFamily: "Georgia, serif", textAlign: "center", lineHeight: 1.2 },
+  tabBtnActive: { color: "#1E1E1E", fontWeight: 700, borderBottom: "2.5px solid #1E1E1E", marginBottom: -2 },
+  body: { padding: "14px 14px 0" },
+  sectionTitle: { fontSize: 9, letterSpacing: 2, color: "#bbb", marginBottom: 10 },
+  catCard: { background: "#fff", borderRadius: 12, padding: "12px 14px", marginBottom: 8, boxShadow: "0 1px 4px rgba(0,0,0,0.06)" },
+  catCardTop: { display: "flex", alignItems: "center", gap: 8, marginBottom: 8 },
+  catIcon: { fontSize: 18 },
+  catName: { flex: 1, fontSize: 13, fontWeight: 600 },
+  catBadge: { fontSize: 10, borderRadius: 20, padding: "3px 8px", fontWeight: 700 },
+  catBarBg: { position: "relative", background: "#F0F0EE", borderRadius: 4, height: 6, overflow: "hidden", marginBottom: 4 },
+  catBarLabels: { display: "flex", justifyContent: "space-between", fontSize: 10, color: "#999" },
+  aiCard: { background: "#1E1E1E", borderRadius: 14, padding: "16px", marginBottom: 16, color: "#fff" },
+  aiCardTop: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 12 },
+  aiTitle: { fontSize: 15, fontWeight: 700 },
+  aiSubtitle: { fontSize: 10, color: "#888", marginTop: 2 },
+  aiBtn: { background: "#F2CC8F", color: "#1E1E1E", border: "none", borderRadius: 8, padding: "8px 14px", fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: "Georgia, serif", flexShrink: 0 },
+  aiLoading: { display: "flex", alignItems: "center", padding: "8px 0" },
+  aiDot: { width: 8, height: 8, borderRadius: "50%", background: "#F2CC8F", animation: "pulse 1s ease-in-out infinite", marginRight: 4 },
+  aiText: { fontSize: 13, color: "#ddd", lineHeight: 1.6, marginTop: 4 },
+  aiPlaceholder: { fontSize: 12, color: "#666", fontStyle: "italic" },
+  monthCard: { background: "#fff", borderRadius: 12, padding: "14px", marginBottom: 10, boxShadow: "0 1px 4px rgba(0,0,0,0.06)" },
+  monthCardTop: { display: "flex", alignItems: "center", gap: 8, marginBottom: 8 },
+  monthLabel: { flex: 1, fontSize: 14, fontWeight: 700 },
+  currentBadge: { background: "#F2CC8F", color: "#1E1E1E", fontSize: 9, borderRadius: 20, padding: "2px 7px", fontWeight: 700 },
+  monthTotal: { fontSize: 16, fontWeight: 700 },
+  miniCatGrid: { marginTop: 8, display: "flex", flexDirection: "column", gap: 4 },
+  miniCatRow: { display: "flex", alignItems: "center", gap: 6 },
+  miniCatIcon: { fontSize: 12, width: 16 },
+  miniBarBg: { height: 4, background: "#F0F0EE", borderRadius: 3, overflow: "hidden" },
+  miniBarFill: { height: "100%", borderRadius: 3 },
+  miniCatAmt: { fontSize: 10, color: "#999", minWidth: 36, textAlign: "right" },
+  subAuditCard: { background: "#fff", borderRadius: 12, padding: "14px", marginBottom: 16, boxShadow: "0 1px 4px rgba(0,0,0,0.06)" },
+  subRow: { display: "flex", alignItems: "center", gap: 8, paddingBottom: 8, marginBottom: 4 },
+  subIcon: { fontSize: 14 },
+  subName: { flex: 1, fontSize: 13 },
+  subAmt: { fontSize: 13, fontWeight: 700, color: "#E07A5F" },
+  subYear: { fontSize: 10, color: "#bbb" },
+  subTotal: { borderTop: "1px solid #eee", paddingTop: 8, fontSize: 12, color: "#888", fontWeight: 700 },
+  modeToggle: { display: "flex", background: "#EEEEED", borderRadius: 10, padding: 4, marginBottom: 12, gap: 4 },
+  modeBtn: { flex: 1, border: "none", borderRadius: 8, padding: "9px", fontSize: 13, cursor: "pointer", background: "transparent", color: "#999", fontFamily: "Georgia, serif" },
+  modeBtnActive: { background: "#fff", color: "#1E1E1E", fontWeight: 700, boxShadow: "0 1px 4px rgba(0,0,0,0.1)" },
+  formCard: { background: "#fff", borderRadius: 14, padding: "18px 16px", boxShadow: "0 1px 6px rgba(0,0,0,0.07)" },
+  field: { marginBottom: 14 },
+  label: { display: "block", fontSize: 10, letterSpacing: 1.5, color: "#999", marginBottom: 5 },
+  input: { width: "100%", border: "1.5px solid #E0E0E0", borderRadius: 9, padding: "10px 12px", fontSize: 16, fontFamily: "Georgia, serif", boxSizing: "border-box", outline: "none", color: "#2D2D2D", background: "#FAFAF8" },
+  error: { color: "#E07A5F", fontSize: 12, marginBottom: 10 },
+  btn: { width: "100%", background: "#1E1E1E", color: "#fff", border: "none", borderRadius: 10, padding: "14px", fontSize: 15, fontWeight: 700, cursor: "pointer", fontFamily: "Georgia, serif", transition: "background 0.3s" },
+  btnFlash: { background: "#81B29A" },
+  recPreview: { fontSize: 12, color: "#888", background: "#F5F5F3", borderRadius: 8, padding: "8px 12px", marginBottom: 14, fontStyle: "italic" },
+  recurringHeader: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 },
+  recTotal: { fontSize: 22, fontWeight: 700, color: "#E07A5F" },
+  addRecBtn: { background: "#1E1E1E", color: "#fff", border: "none", borderRadius: 9, padding: "8px 16px", fontSize: 13, cursor: "pointer", fontFamily: "Georgia, serif" },
+  recGroupLabel: { fontSize: 10, letterSpacing: 1.5, color: "#bbb", marginBottom: 6 },
+  recRow: { display: "flex", alignItems: "center", background: "#fff", borderRadius: 11, padding: "11px 12px", marginBottom: 7, boxShadow: "0 1px 3px rgba(0,0,0,0.05)" },
+  recLeft: { flex: 1 },
+  recName: { fontSize: 13, fontWeight: 700 },
+  recMeta: { fontSize: 10, color: "#aaa", marginTop: 2 },
+  recRight: { display: "flex", alignItems: "center", gap: 6 },
+  recAmount: { fontSize: 15, fontWeight: 700, color: "#E07A5F", minWidth: 50, textAlign: "right" },
+  iconBtn: { background: "none", border: "1px solid #eee", borderRadius: 6, fontSize: 12, cursor: "pointer", padding: "3px 8px", fontWeight: 700 },
+  filterRow: { display: "flex", gap: 8, marginBottom: 10 },
+  filterSelect: { flex: 1, border: "1.5px solid #E0E0E0", borderRadius: 9, padding: "8px 10px", fontSize: 14, fontFamily: "Georgia, serif", background: "#fff", color: "#2D2D2D", outline: "none" },
+  txnCount: { fontSize: 10, color: "#bbb", letterSpacing: 1, marginBottom: 8 },
+  empty: { textAlign: "center", color: "#ccc", fontSize: 14, padding: "40px 0", lineHeight: 1.8 },
+  txnRow: { display: "flex", alignItems: "center", gap: 10, background: "#fff", borderRadius: 11, padding: "11px 12px", marginBottom: 7, boxShadow: "0 1px 3px rgba(0,0,0,0.05)" },
+  txnDot: { width: 10, height: 10, borderRadius: "50%", flexShrink: 0 },
+  txnMid: { flex: 1, minWidth: 0 },
+  txnNote: { fontSize: 13, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+  txnMeta: { fontSize: 10, color: "#aaa", marginTop: 2 },
+  txnRight: { display: "flex", alignItems: "center", gap: 8 },
+  txnAmount: { fontSize: 15, fontWeight: 700, color: "#E07A5F" },
+  delBtn: { background: "none", border: "1px solid #eee", borderRadius: 6, color: "#ccc", fontSize: 11, cursor: "pointer", padding: "3px 7px" },
+  footer: { textAlign: "center", fontSize: 10, color: "#ccc", padding: "16px", fontStyle: "italic" },
+};
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
