@@ -92,8 +92,72 @@ if ('serviceWorker' in navigator) {
 <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
 
+<!-- Firebase SDK (modular, loaded as ES modules) -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+  import { getFirestore, doc, onSnapshot, setDoc } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+  // ============================================================
+  //  🔧  PASTE YOUR FIREBASE CONFIG HERE
+  //  Get this from: Firebase Console → Project Settings →
+  //  "Your apps" → SDK setup and configuration → Config
+  //  Replace the placeholder values below with your real ones.
+  // ============================================================
+  const firebaseConfig = {
+    apiKey: "AIzaSyDVctxu-tqsYA8anEfPZkcJ9glgL5HNmCk",
+    authDomain: "budget-tracker-9857d.firebaseapp.com",
+    projectId: "budget-tracker-9857d",
+    storageBucket: "budget-tracker-9857d.firebasestorage.app",
+    messagingSenderId: "1076869365795",
+    appId: "1:1076869365795:web:9ad76d61e46599c509b196"
+  };
+  // ============================================================
+
+  // The single shared document both phones read/write.
+  const SHARED_DOC_PATH = ["budgets", "family-shared"];
+
+  let firestoreReady = false;
+  let db = null;
+  try {
+    if (!firebaseConfig.apiKey.startsWith("PASTE_")) {
+      const fbApp = initializeApp(firebaseConfig);
+      db = getFirestore(fbApp);
+      firestoreReady = true;
+    }
+  } catch (e) {
+    console.warn("Firebase init failed:", e);
+  }
+
+  // Expose a tiny bridge the React app can call (kept simple on purpose).
+  window.__cloud = {
+    ready: firestoreReady,
+    // subscribe(cb) -> calls cb(data) whenever the shared doc changes
+    subscribe(cb) {
+      if (!firestoreReady) return () => {};
+      const ref = doc(db, ...SHARED_DOC_PATH);
+      return onSnapshot(ref, (snap) => {
+        if (snap.exists()) cb(snap.data());
+        else cb(null);
+      }, (err) => console.warn("snapshot error:", err));
+    },
+    // push(data) -> writes the whole shared state
+    async push(data) {
+      if (!firestoreReady) return false;
+      try {
+        await setDoc(doc(db, ...SHARED_DOC_PATH), data);
+        return true;
+      } catch (e) {
+        console.warn("write failed:", e);
+        return false;
+      }
+    }
+  };
+  // Let the app know the bridge is available even if it loads later.
+  window.dispatchEvent(new Event("cloud-ready"));
+</script>
+
 <script type="text/babel" data-presets="react">
-const { useState, useMemo, useEffect } = React;
+const { useState, useMemo, useEffect, useRef } = React;
 
 const INCOME = 9000;
 const SAVINGS_GOAL = 300;
@@ -179,12 +243,56 @@ function App() {
   const [aiInsight, setAiInsight] = useState("");
   const [aiLoading, setAiLoading] = useState(false);
   const [showInstall, setShowInstall] = useState(false);
+  const [syncStatus, setSyncStatus] = useState("local"); // "local" | "connecting" | "synced" | "offline"
+  const applyingRemote = useRef(false); // guards against write-echo loops
+  const hydrated = useRef(false);       // don't push until first cloud read happens
 
-  // persist on change
-  useEffect(() => save("bt_txn", transactions), [transactions]);
-  useEffect(() => save("bt_rec", recurring), [recurring]);
-  useEffect(() => save("bt_ntid", nextTxnId), [nextTxnId]);
-  useEffect(() => save("bt_nrid", nextRecId), [nextRecId]);
+  // ---------- Cloud sync (Firebase) with localStorage fallback ----------
+  // 1) Subscribe to the shared cloud document. Cloud is the source of truth.
+  useEffect(() => {
+    const cloud = window.__cloud;
+    if (!cloud || !cloud.ready) {
+      // No Firebase config yet — run purely on local storage.
+      setSyncStatus("local");
+      hydrated.current = true;
+      return;
+    }
+    setSyncStatus("connecting");
+    const unsub = cloud.subscribe((data) => {
+      applyingRemote.current = true;
+      if (data && Array.isArray(data.transactions)) {
+        setTransactions(data.transactions);
+        setRecurring(Array.isArray(data.recurring) ? data.recurring : SAMPLE_RECURRING);
+        setNextTxnId(data.nextTxnId || (data.transactions.length + 1));
+        setNextRecId(data.nextRecId || ((data.recurring?.length || 0) + 1));
+      } else {
+        // First run ever: cloud is empty, seed it with whatever we have locally.
+        cloud.push({ transactions, recurring, nextTxnId, nextRecId });
+      }
+      setSyncStatus("synced");
+      hydrated.current = true;
+      // release the guard after this render cycle
+      setTimeout(() => { applyingRemote.current = false; }, 0);
+    });
+    return () => unsub && unsub();
+    // eslint-disable-next-line
+  }, []);
+
+  // 2) Push to cloud whenever local data changes (but not when the change
+  //    came FROM the cloud, and not before the first cloud read).
+  useEffect(() => {
+    // always keep a local backup too
+    save("bt_txn", transactions); save("bt_rec", recurring);
+    save("bt_ntid", nextTxnId); save("bt_nrid", nextRecId);
+
+    const cloud = window.__cloud;
+    if (!cloud || !cloud.ready) return;
+    if (!hydrated.current) return;        // wait for first cloud read
+    if (applyingRemote.current) return;   // this change came from cloud, don't echo
+    cloud.push({ transactions, recurring, nextTxnId, nextRecId }).then((ok) => {
+      setSyncStatus(ok ? "synced" : "offline");
+    });
+  }, [transactions, recurring, nextTxnId, nextRecId]);
 
   // show install hint on iOS Safari (not already installed)
   useEffect(() => {
@@ -249,24 +357,56 @@ function App() {
     return list;
   }, [transactions, filterCat, sortOrder]);
 
+  const fmtMonthKey = (k) => { const [y, m] = k.split("-"); return `${MONTHS[parseInt(m) - 1]} ${y}`; };
+
   const fetchAiInsight = async () => {
     setAiLoading(true); setAiInsight("");
-    const catSummary = CATEGORIES.map((c) => {
-      const rec = recurringMonthly[c.id] || 0, one = oneTimeSpent[c.id] || 0, prev = byMonth["2026-04"]?.[c.id] || 0;
-      return `${c.label}: budget $${c.budget}, spent $${Math.round(rec + one)} (recurring $${Math.round(rec)}, one-time $${Math.round(one)}), prev month one-time $${prev}`;
+
+    // All logged months, oldest -> newest, for a true month-over-month view
+    const orderedMonths = [...monthKeys].sort();
+    const monthNames = orderedMonths.map(fmtMonthKey);
+
+    // Per-category one-time spend across every month (recurring is fixed each month)
+    const perCatTable = CATEGORIES.map((c) => {
+      const rec = recurringMonthly[c.id] || 0;
+      const series = orderedMonths.map((mk) => Math.round((byMonth[mk]?.[c.id] || 0) + rec));
+      return `${c.label} (budget $${c.budget}): ${orderedMonths.map((mk, i) => `${monthNames[i]} $${series[i]}`).join(" → ")}`;
     }).join("\n");
+
+    // Total spend per month (one-time + fixed recurring)
+    const totalsByMonth = orderedMonths.map((mk) => {
+      const oneTime = Object.values(byMonth[mk] || {}).reduce((a, b) => a + b, 0);
+      return Math.round(oneTime + totalRecurring);
+    });
+    const totalsLine = orderedMonths.map((mk, i) => `${monthNames[i]}: $${totalsByMonth[i]} spent, $${SPENDABLE - totalsByMonth[i]} ${SPENDABLE - totalsByMonth[i] >= 0 ? "saved" : "over"}`).join("\n");
+
     const recList = recurring.filter(r => r.active).map(r => `${r.name} ($${r.amount}/${r.frequency})`).join(", ");
-    const prompt = `You are a friendly family budget advisor. Here is this family's May 2026 budget data:
 
-Income: $${INCOME}/mo, Savings goal: $${SAVINGS_GOAL}/mo, Spendable: $${SPENDABLE}/mo
-Total spent this month: $${Math.round(totalSpent)} (${remaining >= 0 ? `$${Math.round(remaining)} under budget` : `$${Math.round(Math.abs(remaining))} OVER budget`})
+    const prompt = `You are a friendly family budget advisor writing this family's monthly summary. Today is the 30th — end of the month review.
 
-Category breakdown:
-${catSummary}
+CONTEXT:
+Income: $${INCOME}/mo · Savings goal: $${SAVINGS_GOAL}/mo · Spendable budget: $${SPENDABLE}/mo
+Fixed recurring bills total: $${Math.round(totalRecurring)}/mo (${recList})
 
-Active recurring expenses: ${recList}
+MONTHLY TOTALS (spend includes fixed bills):
+${totalsLine}
 
-Give a warm, practical monthly summary with: 1) a 2-sentence overall assessment, 2) top 3 specific areas to save money with a dollar amount and concrete tip for each (use bullets), 3) one positive thing they do well, 4) a motivational closing line. Keep it concise and specific. No headers.`;
+PER-CATEGORY TREND (each figure = that month's total incl. fixed bills, oldest to newest):
+${perCatTable}
+
+Write a warm, well-structured monthly summary in this exact order. Use the month names from the data. Be specific with dollar amounts AND percentage changes.
+
+1. OVERALL: 2-3 sentences on how the latest month compares to the prior month and the overall trend (improving/worsening). Lead with whether they hit their $${SAVINGS_GOAL} savings goal.
+
+2. MONTH-OVER-MONTH BREAKDOWN: A bullet for each category that changed meaningfully vs the prior month. Format each as: "Category: $X last month → $Y this month (▲/▼ $Z, N%)" then a 4-6 word note on why it matters. Skip categories that barely moved. Put the biggest changes first.
+
+3. WHERE TO SAVE: Top 2-3 categories with the most room to cut, each with a realistic dollar target and one concrete tip.
+
+4. WIN: One specific thing they did well this month (e.g. a category that dropped or stayed under budget).
+
+5. A short motivational closing line.
+
+Keep it concise and scannable. Use the ▲ and ▼ characters for up/down. No markdown headers — use plain CAPS labels like the numbers above.`;
     try {
       const r = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -278,7 +418,6 @@ Give a warm, practical monthly summary with: 1) a 2-sentence overall assessment,
     setAiLoading(false);
   };
 
-  const fmtMonthKey = (k) => { const [y, m] = k.split("-"); return `${MONTHS[parseInt(m) - 1]} ${y}`; };
   const dismissInstall = () => { setShowInstall(false); save("bt_dismissed_install", true); };
 
   return (
@@ -294,7 +433,14 @@ Give a warm, practical monthly summary with: 1) a 2-sentence overall assessment,
 
       <div style={s.header}>
         <div style={s.headerInner}>
-          <div><div style={s.eyebrow}>MAY 2026</div><div style={s.title}>Family Spending</div></div>
+          <div><div style={s.eyebrow}>MAY 2026</div><div style={s.title}>Family Spending</div>
+            <div style={s.syncRow}>
+              <span style={{ ...s.syncDot, background: syncStatus === "synced" ? "#81B29A" : syncStatus === "connecting" ? "#F2CC8F" : syncStatus === "offline" ? "#E07A5F" : "#666" }} />
+              <span style={s.syncText}>
+                {syncStatus === "synced" ? "Synced — shared with family" : syncStatus === "connecting" ? "Connecting…" : syncStatus === "offline" ? "Offline — will sync later" : "Local only (no cloud config)"}
+              </span>
+            </div>
+          </div>
           <div style={s.chips}>
             <div style={s.chip}><div style={s.chipLabel}>Budget</div><div style={s.chipVal}>{fmt(SPENDABLE)}</div></div>
             <div style={{ ...s.chip, borderColor: remaining < 0 ? "#E07A5F" : "#81B29A" }}>
@@ -353,12 +499,12 @@ Give a warm, practical monthly summary with: 1) a 2-sentence overall assessment,
         <div style={s.body}>
           <div style={s.aiCard}>
             <div style={s.aiCardTop}>
-              <div><div style={s.aiTitle}>✨ AI Savings Analysis</div><div style={s.aiSubtitle}>Personalized tips based on your spending</div></div>
+              <div><div style={s.aiTitle}>✨ Monthly Summary & MoM</div><div style={s.aiSubtitle}>Month-over-month comparison + savings tips</div></div>
               <button onClick={fetchAiInsight} disabled={aiLoading} style={{ ...s.aiBtn, opacity: aiLoading ? 0.6 : 1 }}>{aiLoading ? "Analyzing…" : aiInsight ? "Refresh" : "Analyze"}</button>
             </div>
             {aiLoading && <div style={s.aiLoading}><div style={s.aiDot} /><div style={{ ...s.aiDot, animationDelay: "0.2s" }} /><div style={{ ...s.aiDot, animationDelay: "0.4s" }} /><span style={{ marginLeft: 8, color: "#999", fontSize: 12 }}>Reading your spending…</span></div>}
             {aiInsight && !aiLoading && <div style={s.aiText}>{aiInsight.split("\n").map((line, i) => <p key={i} style={{ margin: "4px 0", lineHeight: 1.6 }}>{line}</p>)}</div>}
-            {!aiInsight && !aiLoading && <div style={s.aiPlaceholder}>Tap "Analyze" for personalized savings tips based on your actual spending.</div>}
+            {!aiInsight && !aiLoading && <div style={s.aiPlaceholder}>Tap "Analyze" for a full month-over-month comparison and savings tips based on your logged data.</div>}
           </div>
           <div style={s.sectionTitle}>MONTH BY MONTH</div>
           {monthKeys.map((key) => {
@@ -465,6 +611,9 @@ const s = {
   headerInner: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 },
   eyebrow: { fontSize: 9, letterSpacing: 3, color: "#777", marginBottom: 2 },
   title: { fontSize: 24, fontWeight: 700 },
+  syncRow: { display: "flex", alignItems: "center", gap: 5, marginTop: 5 },
+  syncDot: { width: 7, height: 7, borderRadius: "50%", flexShrink: 0 },
+  syncText: { fontSize: 9, color: "#999", letterSpacing: 0.3 },
   chips: { display: "flex", gap: 8 },
   chip: { background: "#2A2A2A", border: "1px solid #444", borderRadius: 10, padding: "6px 12px", textAlign: "center" },
   chipLabel: { fontSize: 9, color: "#777", letterSpacing: 1 },
