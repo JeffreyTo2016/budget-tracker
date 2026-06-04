@@ -240,6 +240,8 @@ function App() {
   const [addMode, setAddMode] = useState("onetime");
   const [filterCat, setFilterCat] = useState("all");
   const [sortOrder, setSortOrder] = useState("newest");
+  const [editingTxn, setEditingTxn] = useState(null); // null or txn object being edited
+  const [editForm, setEditForm] = useState({ date: "", categoryId: "", note: "", amount: "" });
   const [aiInsight, setAiInsight] = useState("");
   const [aiLoading, setAiLoading] = useState(false);
   const [showInstall, setShowInstall] = useState(false);
@@ -316,7 +318,7 @@ function App() {
     return m;
   }, [transactions]);
   const monthKeys = useMemo(() => Object.keys(byMonth).sort().reverse(), [byMonth]);
-  const currentMonthKey = "2026-05";
+  const currentMonthKey = new Date().toISOString().slice(0, 7);
 
   const oneTimeSpent = useMemo(() => {
     const o = {}; CATEGORIES.forEach((c) => { o[c.id] = 0; });
@@ -349,7 +351,28 @@ function App() {
   };
   const toggleRecurring = (id) => setRecurring((p) => p.map((r) => r.id === id ? { ...r, active: !r.active } : r));
   const deleteRecurring = (id) => setRecurring((p) => p.filter((r) => r.id !== id));
+  const [editingRec, setEditingRec] = useState(null);
+  const [editRecForm, setEditRecForm] = useState({ name: "", categoryId: "", amount: "", frequency: "monthly", dayOfMonth: 1 });
+  const startEditRec = (r) => { setEditingRec(r); setEditRecForm({ name: r.name, categoryId: r.categoryId, amount: String(r.amount), frequency: r.frequency, dayOfMonth: r.dayOfMonth }); };
+  const cancelEditRec = () => setEditingRec(null);
+  const saveEditRec = () => {
+    if (!editRecForm.amount || isNaN(Number(editRecForm.amount)) || Number(editRecForm.amount) <= 0) return;
+    if (!editRecForm.name.trim()) return;
+    setRecurring((p) => p.map((r) => r.id === editingRec.id ? { ...r, name: editRecForm.name.trim(), categoryId: editRecForm.categoryId, amount: Number(editRecForm.amount), frequency: editRecForm.frequency, dayOfMonth: Number(editRecForm.dayOfMonth) } : r));
+    setEditingRec(null);
+  };
   const deleteTransaction = (id) => setTransactions((p) => p.filter((t) => t.id !== id));
+  const startEdit = (txn) => {
+    setEditingTxn(txn);
+    setEditForm({ date: txn.date, categoryId: txn.categoryId, note: txn.note, amount: String(txn.amount) });
+  };
+  const cancelEdit = () => { setEditingTxn(null); };
+  const saveEdit = () => {
+    if (!editForm.amount || isNaN(Number(editForm.amount)) || Number(editForm.amount) <= 0) return;
+    if (!editForm.note.trim()) return;
+    setTransactions((p) => p.map((t) => t.id === editingTxn.id ? { ...t, date: editForm.date, categoryId: editForm.categoryId, note: editForm.note.trim(), amount: Number(editForm.amount) } : t));
+    setEditingTxn(null);
+  };
 
   const filtered = useMemo(() => {
     let list = filterCat === "all" ? [...transactions] : transactions.filter((t) => t.categoryId === filterCat);
@@ -433,7 +456,7 @@ Keep it concise and scannable. Use the ▲ and ▼ characters for up/down. No ma
 
       <div style={s.header}>
         <div style={s.headerInner}>
-          <div><div style={s.eyebrow}>MAY 2026</div><div style={s.title}>Family Spending</div>
+          <div><div style={s.eyebrow}>{MONTHS[new Date().getMonth()].toUpperCase()} {new Date().getFullYear()}</div><div style={s.title}>Family Spending</div>
             <div style={s.syncRow}>
               <span style={{ ...s.syncDot, background: syncStatus === "synced" ? "#81B29A" : syncStatus === "connecting" ? "#F2CC8F" : syncStatus === "offline" ? "#E07A5F" : "#666" }} />
               <span style={s.syncText}>
@@ -575,10 +598,35 @@ Keep it concise and scannable. Use the ▲ and ▼ characters for up/down. No ma
           {CATEGORIES.map((cat) => {
             const catRec = recurring.filter((r) => r.categoryId === cat.id); if (catRec.length === 0) return null;
             return (<div key={cat.id} style={{ marginBottom: 14 }}><div style={s.recGroupLabel}>{cat.icon} {cat.label}</div>
-              {catRec.map((r) => (<div key={r.id} style={{ ...s.recRow, opacity: r.active ? 1 : 0.45 }}>
+              {catRec.map((r) => {
+                if (editingRec && editingRec.id === r.id) {
+                  return (
+                    <div key={r.id} style={{ ...s.recRow, flexDirection: "column", alignItems: "stretch", gap: 8, padding: "14px" }}>
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <input type="text" value={editRecForm.name} onChange={(e) => setEditRecForm((f) => ({ ...f, name: e.target.value }))} placeholder="Name" style={{ ...s.editInput, flex: 2 }} />
+                        <input type="number" value={editRecForm.amount} onChange={(e) => setEditRecForm((f) => ({ ...f, amount: e.target.value }))} placeholder="$" min="0" step="0.01" style={{ ...s.editInput, flex: 1, fontWeight: 700 }} />
+                      </div>
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <select value={editRecForm.categoryId} onChange={(e) => setEditRecForm((f) => ({ ...f, categoryId: e.target.value }))} style={{ ...s.editInput, flex: 1 }}>
+                          {CATEGORIES.map((c) => <option key={c.id} value={c.id}>{c.icon} {c.label}</option>)}
+                        </select>
+                        <select value={editRecForm.frequency} onChange={(e) => setEditRecForm((f) => ({ ...f, frequency: e.target.value }))} style={{ ...s.editInput, flex: 1 }}>
+                          <option value="monthly">Monthly</option><option value="weekly">Weekly</option><option value="yearly">Yearly</option>
+                        </select>
+                        {editRecForm.frequency === "monthly" && <input type="number" value={editRecForm.dayOfMonth} onChange={(e) => setEditRecForm((f) => ({ ...f, dayOfMonth: e.target.value }))} min="1" max="31" placeholder="Day" style={{ ...s.editInput, width: 55 }} />}
+                      </div>
+                      <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                        <button onClick={cancelEditRec} style={s.editCancelBtn}>Cancel</button>
+                        <button onClick={saveEditRec} style={s.editSaveBtn}>Save</button>
+                      </div>
+                    </div>
+                  );
+                }
+                return (<div key={r.id} style={{ ...s.recRow, opacity: r.active ? 1 : 0.45 }} onClick={() => startEditRec(r)}>
                 <div style={s.recLeft}><div style={s.recName}>{r.name}</div><div style={s.recMeta}>{FREQ_LABELS[r.frequency]}{r.frequency === "monthly" && ` · due day ${r.dayOfMonth}`}</div></div>
-                <div style={s.recRight}><div style={s.recAmount}>{fmt(r.amount)}</div><button onClick={() => toggleRecurring(r.id)} style={{ ...s.iconBtn, color: r.active ? "#81B29A" : "#ccc" }}>{r.active ? "✓" : "○"}</button><button onClick={() => deleteRecurring(r.id)} style={{ ...s.iconBtn, color: "#eee" }}>✕</button></div>
-              </div>))}
+                <div style={s.recRight}><div style={s.recAmount}>{fmt(r.amount)}</div><button onClick={(e) => { e.stopPropagation(); toggleRecurring(r.id); }} style={{ ...s.iconBtn, color: r.active ? "#81B29A" : "#ccc" }}>{r.active ? "✓" : "○"}</button><button onClick={(e) => { e.stopPropagation(); deleteRecurring(r.id); }} style={{ ...s.iconBtn, color: "#eee" }}>✕</button></div>
+              </div>);
+              })}
             </div>);
           })}
         </div>
@@ -593,7 +641,31 @@ Keep it concise and scannable. Use the ▲ and ▼ characters for up/down. No ma
           <div style={s.txnCount}>{filtered.length} transaction{filtered.length !== 1 ? "s" : ""} · {fmt(filtered.reduce((a, t) => a + t.amount, 0))}</div>
           {filtered.length === 0 && <div style={s.empty}>No expenses yet.</div>}
           {filtered.map((txn) => { const cat = getCat(txn.categoryId);
-            return (<div key={txn.id} style={s.txnRow}><div style={{ ...s.txnDot, background: cat?.color }} /><div style={s.txnMid}><div style={s.txnNote}>{txn.note}</div><div style={s.txnMeta}>{cat?.icon} {cat?.label} · {txn.date}</div></div><div style={s.txnRight}><div style={s.txnAmount}>{fmt(txn.amount)}</div><button onClick={() => deleteTransaction(txn.id)} style={s.delBtn}>✕</button></div></div>);
+            if (editingTxn && editingTxn.id === txn.id) {
+              return (
+                <div key={txn.id} style={{ ...s.txnRow, flexDirection: "column", alignItems: "stretch", gap: 8, padding: "14px" }}>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <input type="date" value={editForm.date} onChange={(e) => setEditForm((f) => ({ ...f, date: e.target.value }))} style={{ ...s.editInput, flex: 1 }} />
+                    <select value={editForm.categoryId} onChange={(e) => setEditForm((f) => ({ ...f, categoryId: e.target.value }))} style={{ ...s.editInput, flex: 1 }}>
+                      {CATEGORIES.map((c) => <option key={c.id} value={c.id}>{c.icon} {c.label}</option>)}
+                    </select>
+                  </div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <input type="text" value={editForm.note} onChange={(e) => setEditForm((f) => ({ ...f, note: e.target.value }))} placeholder="Note" style={{ ...s.editInput, flex: 2 }} />
+                    <input type="number" value={editForm.amount} onChange={(e) => setEditForm((f) => ({ ...f, amount: e.target.value }))} placeholder="$" min="0" step="0.01" style={{ ...s.editInput, flex: 1, fontWeight: 700 }} />
+                  </div>
+                  <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                    <button onClick={cancelEdit} style={s.editCancelBtn}>Cancel</button>
+                    <button onClick={saveEdit} style={s.editSaveBtn}>Save</button>
+                  </div>
+                </div>
+              );
+            }
+            return (<div key={txn.id} style={s.txnRow} onClick={() => startEdit(txn)}>
+              <div style={{ ...s.txnDot, background: cat?.color }} />
+              <div style={s.txnMid}><div style={s.txnNote}>{txn.note}</div><div style={s.txnMeta}>{cat?.icon} {cat?.label} · {txn.date}</div></div>
+              <div style={s.txnRight}><div style={s.txnAmount}>{fmt(txn.amount)}</div><button onClick={(e) => { e.stopPropagation(); deleteTransaction(txn.id); }} style={s.delBtn}>✕</button></div>
+            </div>);
           })}
         </div>
       )}
@@ -693,6 +765,9 @@ const s = {
   txnRight: { display: "flex", alignItems: "center", gap: 8 },
   txnAmount: { fontSize: 15, fontWeight: 700, color: "#E07A5F" },
   delBtn: { background: "none", border: "1px solid #eee", borderRadius: 6, color: "#ccc", fontSize: 11, cursor: "pointer", padding: "3px 7px" },
+  editInput: { border: "1.5px solid #E0E0E0", borderRadius: 8, padding: "8px 10px", fontSize: 13, fontFamily: "Georgia, serif", boxSizing: "border-box", outline: "none", color: "#2D2D2D", background: "#FAFAF8" },
+  editSaveBtn: { background: "#1E1E1E", color: "#fff", border: "none", borderRadius: 8, padding: "8px 16px", fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: "Georgia, serif" },
+  editCancelBtn: { background: "transparent", color: "#999", border: "1px solid #ddd", borderRadius: 8, padding: "8px 16px", fontSize: 12, cursor: "pointer", fontFamily: "Georgia, serif" },
   footer: { textAlign: "center", fontSize: 10, color: "#ccc", padding: "16px", fontStyle: "italic" },
 };
 
